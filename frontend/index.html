@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Soccer Tracking Dashboard</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; background-color: #f4f4f9; }
+        .dashboard { max-width: 1100px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        button { padding: 10px 15px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; margin-bottom: 20px; }
+        button:hover { background-color: #0056b3; }
+        
+        /* ピッチを描画するキャンバスの装飾 */
+        #pitchCanvas {
+            background-color: #4CAF50; /* ピッチの緑色 */
+            border: 2px solid #333;
+            display: block;
+            margin: 0 auto;
+        }
+    </style>
+</head>
+<body>
+    <div class="dashboard">
+        <h2>⚽️ トラッキングデータ可視化ダッシュボード</h2>
+        <button id="fetchDataBtn">データを取得して描画</button>
+        
+        <canvas id="pitchCanvas" width="1050" height="680"></canvas>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
