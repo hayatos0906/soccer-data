@@ -228,6 +228,7 @@ async function fetchAndAnimate() {
 
 /**
  * ページ読み込み時に /api/meta を叩き、フレーム範囲の初期値をUIに設定する。
+ * あわせて Top 10 ハイライトも読み込む。
  * サーバーが起動していない場合は静かに失敗する。
  */
 async function initUI() {
@@ -235,18 +236,261 @@ async function initUI() {
     try {
         const metaRes = await fetch(`${BASE_URL}/api/meta/${gameId}`);
         if (!metaRes.ok) return;
-        const m = await metaRes.json();
+        meta = await metaRes.json();
 
-        // デフォルト表示範囲: 先頭から 300 フレーム
-        document.getElementById('frameStartInput').value = m.frame_range.start;
+        document.getElementById('frameStartInput').value = meta.frame_range.start;
         document.getElementById('frameEndInput').value   =
-            Math.min(m.frame_range.start + 300, m.frame_range.end);
+            Math.min(meta.frame_range.start + 300, meta.frame_range.end);
+
+        // cfCanvas の高さをピッチ比率に合わせる
+        const cfCanvas = document.getElementById('cfCanvas');
+        cfCanvas.height = Math.round(cfCanvas.width * meta.pitch.width / meta.pitch.length);
+
+        await loadTopEvents(gameId);
     } catch (_) {
         // サーバー未起動の場合は何もしない
     }
 }
 
-// 試合IDが変わったらフレーム範囲のデフォルトを更新する
+// ================================================================== //
+// Top 10 ハイライトパネル
+// ================================================================== //
+
+/**
+ * /api/top_events から Top 10 を取得してリストを描画する。
+ */
+async function loadTopEvents(gameId) {
+    try {
+        const res = await fetch(`${BASE_URL}/api/top_events/${gameId}`);
+        if (!res.ok) return;
+        const events = await res.json();
+        document.getElementById('topLoadingMsg').style.display = 'none';
+        renderTopList(events, gameId);
+    } catch (_) {}
+}
+
+function renderTopList(events, gameId) {
+    const container = document.getElementById('topEventsList');
+    if (!events.length) {
+        container.innerHTML = '<p style="color:#999">データなし</p>';
+        return;
+    }
+
+    const table = document.createElement('table');
+    table.innerHTML = `
+        <thead>
+            <tr>
+                <th>#</th><th>選手</th><th>スコア</th>
+                <th>反事実PC</th><th>イベント</th><th>フレーム</th>
+            </tr>
+        </thead>
+        <tbody>
+            ${events.map(e => `
+                <tr class="data-row"
+                    data-event-id="${e.event_id}"
+                    data-player-id="${e.player_id}"
+                    data-score="${e.importance_score}"
+                    data-marginal="${e.marginal_pc}"
+                    data-type="${e.event_type}"
+                    data-frame="${e.frame_id}">
+                    <td>${e.rank}</td>
+                    <td><strong>${e.player_id}</strong></td>
+                    <td>${(e.importance_score * 100).toFixed(1)}%</td>
+                    <td>+${e.marginal_pc.toFixed(3)}</td>
+                    <td>${e.event_type}</td>
+                    <td>${e.frame_id}</td>
+                </tr>
+            `).join('')}
+        </tbody>
+    `;
+
+    table.querySelectorAll('tr.data-row').forEach(row => {
+        row.addEventListener('click', () => {
+            table.querySelectorAll('tr.data-row').forEach(r => r.classList.remove('selected'));
+            row.classList.add('selected');
+            fetchAndDrawCounterfactual(
+                gameId,
+                parseInt(row.dataset.eventId),
+                row.dataset.playerId,
+                {
+                    score:    parseFloat(row.dataset.score),
+                    marginal: parseFloat(row.dataset.marginal),
+                    type:     row.dataset.type,
+                    frame:    parseInt(row.dataset.frame),
+                }
+            );
+        });
+    });
+
+    container.innerHTML = '';
+    container.appendChild(table);
+}
+
+/**
+ * 選手クリック時: /api/counterfactual を叩いて差分ヒートマップを描画する。
+ * 計算に数秒かかるため、ローディング表示を出してから実行する。
+ */
+async function fetchAndDrawCounterfactual(gameId, eventId, playerId, info) {
+    const cfInfo    = document.getElementById('cfInfo');
+    const cfLoading = document.getElementById('cfLoading');
+    const cfCanvas  = document.getElementById('cfCanvas');
+
+    cfLoading.classList.add('visible');
+    cfInfo.innerHTML = `<span style="color:#666">${playerId} の反事実計算中...</span>`;
+
+    try {
+        const res = await fetch(
+            `${BASE_URL}/api/counterfactual/${gameId}?event_id=${eventId}&player_id=${playerId}`
+        );
+        if (!res.ok) throw new Error(`API エラー: ${res.status}`);
+        const data = await res.json();
+
+        cfInfo.innerHTML = `
+            <strong>${playerId}</strong>
+            &nbsp;·&nbsp; ${info.type || 'イベント'}
+            &nbsp;·&nbsp; フレーム ${info.frame}
+            &nbsp;&nbsp;
+            スコア: <strong>${(info.score * 100).toFixed(1)}%</strong>
+            &nbsp;|&nbsp;
+            反事実 PC 貢献: <strong>+${info.marginal.toFixed(3)}</strong>
+            <br>
+            <small>オレンジが濃いエリアほど、この選手によって生み出された（または守られた）空間です</small>
+        `;
+
+        drawCounterfactual(cfCanvas, data);
+    } catch (err) {
+        cfInfo.innerHTML = `<span style="color:red">エラー: ${err.message}</span>`;
+    } finally {
+        cfLoading.classList.remove('visible');
+    }
+}
+
+/**
+ * 反事実ピッチコントロール差分ヒートマップを描画する。
+ *
+ * - オレンジのグラデーション: diff_grid の正の値（この選手の貢献エリア）
+ * - 対象選手: 黄色の大きい円 + ラベル
+ * - 他の選手: チームカラーの小さい半透明円
+ * - ボール: 白い円
+ *
+ * 座標系は to_single_playing_direction 適用済みのメートル値。
+ */
+function drawCounterfactual(cfCanvas, data) {
+    const ctx  = cfCanvas.getContext('2d');
+    const w    = cfCanvas.width;
+    const h    = cfCanvas.height;
+
+    // ピッチ背景
+    ctx.fillStyle = '#4CAF50';
+    ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(w / 2, 0);
+    ctx.lineTo(w / 2, h);
+    ctx.stroke();
+    ctx.strokeRect(0, 0, w, h);
+
+    // diff_grid のヒートマップ描画
+    const grid   = data.diff_grid;
+    const nRows  = grid.length;
+    const nCols  = grid[0].length;
+    const maxVal = Math.max(...grid.flat(), 0.001);
+    const cellW  = w / nCols;
+    const cellH  = h / nRows;
+
+    for (let i = 0; i < nRows; i++) {
+        for (let j = 0; j < nCols; j++) {
+            const val = grid[i][j];
+            if (val <= 0.001) continue;
+            // 正規化した値を透明度に変換（最大値で 0.85 になるよう調整）
+            const alpha = Math.min(val / maxVal, 1.0) * 0.85;
+            ctx.fillStyle = `rgba(255, 110, 0, ${alpha})`;
+            ctx.fillRect(j * cellW, i * cellH, cellW + 1, cellH + 1);
+        }
+    }
+
+    // 座標変換（to_single_playing_direction 空間 → canvas ピクセル）
+    // xgrid の端からピッチ境界を復元する（セル中心からセル幅/2 を引いた点が端）
+    const halfLen = meta ? meta.pitch.length / 2 : 53;
+    const halfWid = meta ? meta.pitch.width  / 2 : 34;
+
+    function toCF(x, y) {
+        return [
+            Math.min(Math.max((x + halfLen) / (halfLen * 2) * w, 0), w),
+            Math.min(Math.max((y + halfWid) / (halfWid * 2) * h, 0), h),
+        ];
+    }
+
+    // 全選手を描画
+    const teamDefs = [
+        { prefix: 'Home', dataKey: 'home_data', color: '#e74c3c' },
+        { prefix: 'Away', dataKey: 'away_data', color: '#3498db' },
+    ];
+
+    for (const td of teamDefs) {
+        const teamData = data[td.dataKey];
+        if (!teamData) continue;
+
+        const playerKeys = Object.keys(teamData)
+            .filter(k =>
+                k.startsWith(td.prefix + '_') &&
+                k.endsWith('_x') &&
+                !k.endsWith('_vx')
+            );
+
+        for (const key of playerKeys) {
+            const pid = key.slice(td.prefix.length + 1, -2);
+            const x   = teamData[`${td.prefix}_${pid}_x`];
+            const y   = teamData[`${td.prefix}_${pid}_y`];
+            if (x === 0 && y === 0) continue;
+
+            const [cx, cy]  = toCF(x, y);
+            const fullId    = `${td.prefix}_${pid}`;
+            const isTarget  = fullId === data.player_id;
+
+            if (isTarget) {
+                // 対象選手: 白いリング + 黄色の大きい円 + ラベル
+                ctx.beginPath();
+                ctx.arc(cx, cy, 15, 0, Math.PI * 2);
+                ctx.strokeStyle = 'white';
+                ctx.lineWidth   = 3;
+                ctx.stroke();
+
+                ctx.beginPath();
+                ctx.arc(cx, cy, 10, 0, Math.PI * 2);
+                ctx.fillStyle = 'yellow';
+                ctx.fill();
+
+                ctx.fillStyle  = '#222';
+                ctx.font       = 'bold 11px sans-serif';
+                ctx.textAlign  = 'center';
+                ctx.textBaseline = 'bottom';
+                ctx.fillText(fullId, cx, cy - 18);
+                ctx.textBaseline = 'alphabetic';
+            } else {
+                ctx.globalAlpha = 0.65;
+                ctx.beginPath();
+                ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+                ctx.fillStyle = td.color;
+                ctx.fill();
+                ctx.globalAlpha = 1.0;
+            }
+        }
+    }
+
+    // ボール（白い円）
+    const [bx, by] = toCF(data.ball_pos[0], data.ball_pos[1]);
+    ctx.beginPath();
+    ctx.arc(bx, by, 5, 0, Math.PI * 2);
+    ctx.fillStyle   = 'white';
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth   = 1.5;
+    ctx.fill();
+    ctx.stroke();
+}
+
+// 試合IDが変わったらフレーム範囲とTop10を更新する
 document.getElementById('gameIdInput').addEventListener('change', initUI);
 document.getElementById('fetchDataBtn').addEventListener('click', fetchAndAnimate);
 window.addEventListener('load', initUI);

@@ -6,6 +6,8 @@
     <style>
         body { font-family: sans-serif; padding: 20px; background-color: #f4f4f9; }
         .dashboard { max-width: 1100px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+
+        /* ── アニメーション操作 ── */
         .controls { display: flex; gap: 16px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 16px; }
         .control-group { display: flex; flex-direction: column; gap: 4px; }
         .control-group label { font-size: 12px; color: #666; font-weight: bold; }
@@ -13,10 +15,43 @@
         button { padding: 9px 18px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }
         button:hover { background-color: #0056b3; }
         #pitchCanvas { background-color: #4CAF50; border: 2px solid #333; display: block; margin: 0 auto; }
+
+        /* ── ハイライトパネル ── */
+        .highlight-panel { margin-top: 32px; border-top: 2px solid #e0e0e0; padding-top: 20px; }
+        .highlight-panel h3 { margin: 0 0 12px; font-size: 16px; color: #333; }
+        .highlight-body { display: flex; gap: 24px; align-items: flex-start; }
+
+        /* リスト */
+        .top-list { flex: 0 0 440px; }
+        .top-list table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        .top-list th { background: #f0f0f0; padding: 7px 8px; text-align: left; border-bottom: 2px solid #ddd; white-space: nowrap; }
+        .top-list td { padding: 6px 8px; border-bottom: 1px solid #eee; cursor: pointer; white-space: nowrap; }
+        .top-list tr.data-row:hover td { background: #f0f7ff; }
+        .top-list tr.data-row.selected td { background: #dbeeff; font-weight: bold; }
+        #topLoadingMsg { color: #999; font-size: 13px; }
+
+        /* 可視化エリア */
+        .viz-section { flex: 1; min-width: 0; }
+        .cf-info { font-size: 13px; color: #333; margin-bottom: 8px; min-height: 36px; }
+        .cf-info strong { color: #111; }
+        .cf-info small { color: #888; }
+        .cf-canvas-wrap { position: relative; display: inline-block; }
+        #cfCanvas { background-color: #4CAF50; border: 2px solid #333; display: block; }
+        .cf-loading {
+            display: none;
+            position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.45);
+            color: white; font-size: 18px; font-weight: bold;
+            justify-content: center; align-items: center;
+            border-radius: 2px;
+        }
+        .cf-loading.visible { display: flex; }
     </style>
 </head>
 <body>
     <div class="dashboard">
+
+        <!-- ── アニメーション ── -->
         <h2>⚽️ データ可視化</h2>
         <div class="controls">
             <div class="control-group">
@@ -33,10 +68,35 @@
             </div>
             <button id="fetchDataBtn">描画</button>
         </div>
-        <!-- canvas の高さは app.js がピッチ縦幅 × スケールで自動計算する -->
         <canvas id="pitchCanvas" width="1050" height="680"></canvas>
-    </div>
 
+        <!-- ── Top 10 ハイライト ── -->
+        <div class="highlight-panel">
+            <h3>Top 10 ハイライト — 反事実ピッチコントロール貢献度</h3>
+            <div class="highlight-body">
+
+                <!-- 左: ランキングリスト -->
+                <div class="top-list">
+                    <div id="topLoadingMsg">サーバー起動後に自動で読み込まれます...</div>
+                    <div id="topEventsList"></div>
+                </div>
+
+                <!-- 右: 差分ヒートマップ -->
+                <div class="viz-section">
+                    <div class="cf-info" id="cfInfo">
+                        左のリストから選手をクリックすると、<br>
+                        その選手がいる場合といない場合のピッチ支配の差分を表示します。
+                    </div>
+                    <div class="cf-canvas-wrap">
+                        <canvas id="cfCanvas" width="500" height="321"></canvas>
+                        <div class="cf-loading" id="cfLoading">計算中...</div>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+    </div>
     <script src="app.js"></script>
 </body>
 </html>
