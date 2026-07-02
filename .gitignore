@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ==========================================
+# 🚨 バックエンドデータ防衛ライン（絶対に消すな）
+# ==========================================
+backend/data/*.csv
+backend/data/Sample_Game_2/Sample_Game_2_Raw*.csv
+!backend/data/Sample_Game_2/player_importance.csv
