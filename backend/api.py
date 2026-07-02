@@ -25,6 +25,10 @@ def _load_game_data(game_id: int):
     home   = mio.tracking_data(DATADIR, game_id, 'Home')
     away   = mio.tracking_data(DATADIR, game_id, 'Away')
     events = mio.read_event_data(DATADIR, game_id)
+    # イベントCSVの列名・値に空白が含まれる場合があるため前処理する
+    events.columns = events.columns.str.strip()
+    for col in [c for c in events.columns if c[-1] in ['X', 'Y']]:
+        events[col] = pd.to_numeric(events[col], errors='coerce')
     home   = mio.to_metric_coordinates(home)
     away   = mio.to_metric_coordinates(away)
     events = mio.to_metric_coordinates(events)
@@ -38,15 +42,34 @@ def _load_game_data(game_id: int):
     return _game_data_cache[game_id]
 
 
-def _active_players(players, ball_pos, threshold=40.0):
-    """GKとボールから40m超の選手を除外する（player_importance.py と同じ基準）"""
-    return [
-        p for p in players
-        if not p.is_gk and np.linalg.norm(p.position - ball_pos) <= threshold
-    ]
+MIN_VELOCITY       = 1.5   # player_importance.py と同じ（静止選手を除外）
+PASSIVE_THRESHOLD  = 30.0  # player_importance.py と同じ（距離フィルター）
+BEHIND_BALL_MARGIN = 5.0   # player_importance.py と同じ（攻撃側の後方カット）
+GAUSSIAN_SIGMA     = 10.0  # player_importance.py と同じ（σ=10m）
 
 
-GAUSSIAN_SIGMA = 20.0  # player_importance.py と同じ値（ボール近傍を重視する標準偏差）
+def _active_players(players, ball_pos, att_team=None, att_direction=1):
+    """
+    player_importance.py と同じ基準でアクティブ選手を絞る。
+      - GK除外
+      - 距離30m超除外
+      - 速度1.5m/s未満除外（静止選手）
+      - 攻撃チームの選手がボールより5m以上後方なら除外
+    """
+    active = []
+    for p in players:
+        if p.is_gk:
+            continue
+        if np.linalg.norm(p.position - ball_pos) > PASSIVE_THRESHOLD:
+            continue
+        if np.linalg.norm(p.velocity) < MIN_VELOCITY:
+            continue
+        if att_team and p.teamname == att_team:
+            behind = (p.position[0] - ball_pos[0]) * att_direction
+            if behind < -BEHIND_BALL_MARGIN:
+                continue
+        active.append(p)
+    return active
 
 def _compute_pc_grid(att, defn, ball_pos, params, n_x=25, field=(106., 68.)):
     """
@@ -342,8 +365,9 @@ def get_counterfactual(game_id: int, event_id: int, player_id: str):
         defn = mpc.initialise_players(home.loc[frame_id], 'Home', params, gk[0])
         att  = mpc.initialise_players(away.loc[frame_id], 'Away', params, gk[1])
 
-    att  = _active_players(att,  ball_pos)
-    defn = _active_players(defn, ball_pos)
+    att_direction = int(mio.find_playing_direction(home, 'Home')) if possession_team == 'Home' else -int(mio.find_playing_direction(home, 'Home'))
+    att  = _active_players(att,  ball_pos, possession_team, att_direction)
+    defn = _active_players(defn, ball_pos, possession_team, att_direction)
 
     grid_base, weights, xgrid, ygrid = _compute_pc_grid(att, defn, ball_pos, params)
 

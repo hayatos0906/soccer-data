@@ -28,29 +28,38 @@ from scripts import Metrica_PitchControl as mpc
 # 定数
 # ------------------------------------------------------------------ #
 N_GRID_X              = 25    # 可視化用グリッド解像度（分析用は50）
-GAUSSIAN_SIGMA        = 20.0  # ガウス重みの標準偏差 [m]
-PASSIVE_DIST_THRESH   = 40.0  # この距離を超えた選手は「局面外」とみなして除外 [m]
+GAUSSIAN_SIGMA        = 10.0  # ガウス重みの標準偏差 [m]（api.py・player_importance.py と統一）
+PASSIVE_DIST_THRESH   = 30.0  # 距離フィルター閾値 [m]（同上）
+MIN_VELOCITY          = 1.5   # 速度フィルター閾値 [m/s]（同上）
+BEHIND_BALL_MARGIN    = 5.0   # 攻撃チームの後方カット [m]（同上）
 
 
 # ------------------------------------------------------------------ #
 # 内部ユーティリティ
 # ------------------------------------------------------------------ #
 
-def _active_players(players: list, ball_pos: np.ndarray) -> list:
+def _active_players(players: list, ball_pos: np.ndarray, att_team: str = '', att_direction: int = 1) -> list:
     """
-    GK とボールから PASSIVE_DIST_THRESH メートル超の選手を除外する。
-
-    除外対象:
-      - GK: ゴール前を守るだけで局面への能動的寄与が間接的
-      - 40m 超: 攻撃側後方残留DF・守備側カウンター待機FWが典型
-        （「誰でも代替できる立ち位置」のため分析対象外）
-    DFのカバーリングは通常 15〜30m 圏内なので除外されない。
+    api.py・player_importance.py と同じ基準でアクティブ選手を絞る。
+      - GK除外
+      - 距離 PASSIVE_DIST_THRESH 超除外
+      - 速度 MIN_VELOCITY 未満除外（静止選手）
+      - 攻撃チームの選手がボールより BEHIND_BALL_MARGIN 以上後方なら除外
     """
-    return [
-        p for p in players
-        if not p.is_gk
-        and np.linalg.norm(p.position - ball_pos) <= PASSIVE_DIST_THRESH
-    ]
+    active = []
+    for p in players:
+        if p.is_gk:
+            continue
+        if np.linalg.norm(p.position - ball_pos) > PASSIVE_DIST_THRESH:
+            continue
+        if np.linalg.norm(p.velocity) < MIN_VELOCITY:
+            continue
+        if att_team and p.teamname == att_team:
+            behind = (p.position[0] - ball_pos[0]) * att_direction
+            if behind < -BEHIND_BALL_MARGIN:
+                continue
+        active.append(p)
+    return active
 
 
 def _gaussian_weight(target: np.ndarray, ball_pos: np.ndarray) -> float:
