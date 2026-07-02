@@ -220,3 +220,29 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# macOS / Windows
+.DS_Store
+**/.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Docker local overrides (keep compose files tracked)
+docker-compose.override.yml
+docker-compose.override.yaml
+
+# ==========================================
+# バックエンドデータ（Metrica 生 CSV はローカル取得・コミット禁止）
+# ==========================================
+backend/data/**/Sample_Game_*_Raw*.csv
+!backend/data/**/player_importance.csv

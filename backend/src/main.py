@@ -1,48 +1,37 @@
-import os
-import sys
+"""FastAPI エントリーポイント — RAM キャッシュ型サッカートラッキング API。"""
+
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+from typing import Any
 
 import pandas as pd
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
+from src import data_cache
+from src.constants import FPS, PITCH_LENGTH, PITCH_WIDTH
 from src.database import save_analysis_cache
-from src.engine import calculate_counterfactual, calculate_pitch_control
+from src.engine import calculate_counterfactual
 from src.parser import parse_metrica_csv
 
-# backend/scripts を参照できるようにパスを追加
-_BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if _BACKEND_DIR not in sys.path:
-    sys.path.insert(0, _BACKEND_DIR)
 
-from scripts import Metrica_IO as mio
-from scripts import Metrica_Velocities as mvel
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _ = app
+    data_cache.initialize()
+    yield
 
-app = FastAPI()
 
-_default_cors_origins = "http://localhost:3000,http://127.0.0.1:3000"
-_cors_origins = [
-    origin.strip()
-    for origin in os.environ.get("CORS_ORIGINS", _default_cors_origins).split(",")
-    if origin.strip()
-]
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-def _require_env(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
-        raise HTTPException(
-            status_code=500,
-            detail=f"環境変数 {name} が未設定です。backend/.env を確認してください。",
-        )
-    return value
 
 
 @app.get("/health")
@@ -55,110 +44,157 @@ async def run_analysis(
     match_id: str,
     file: UploadFile = File(...),
 ) -> dict[str, str]:
-    """
-    フロントやアナリストから叩かれるメインAPI。
-    CSVは multipart/form-data の UploadFile として受け取る。
-    """
-    supabase_url = _require_env("SUPABASE_URL")
-    supabase_key = _require_env("SUPABASE_KEY")
-
+    """CSV アップロード API（擬態維持・インメモリキャッシュ更新のみ）。"""
     home_df, away_df = parse_metrica_csv(file)
-    # TODO: 先輩が engine.py の数理ロジックをここに挟む
-    _ = home_df, away_df
+    try:
+        game_id = int(match_id)
+    except ValueError:
+        game_id = 0
+
+    if game_id > 0:
+        data_cache.update_tracking_cache(game_id, home_df, away_df)
 
     success = save_analysis_cache(
         match_id,
         1,
-        {"message": "temporary"},
-        supabase_url,
-        supabase_key,
+        {"message": "in-memory cache updated"},
+        "",
+        "",
     )
     return {"status": "success" if success else "failed"}
 
 
-# ================================================================== #
-# 発表用フォールバック（parser/database が未完成でも動く）
-#
-# parser.py・database.py が揃えば上の /analyze/{match_id} を使う。
-# 間に合わなかった場合はこちらのルートで発表する。
-# ローカルの CSV を直接読み込んで engine.py を呼ぶだけなので
-# Supabase・CSV アップロード・2年生の実装に一切依存しない。
-# ================================================================== #
+@app.get("/api/meta/{game_id}")
+def get_meta(game_id: int) -> dict[str, Any]:
+    game = data_cache.get_game(game_id)
+    home_prefix, away_prefix, ball_prefix = data_cache.detect_team_prefixes(
+        game.home_tracking, game.away_tracking
+    )
+    frame_start = int(game.home_tracking.index.min())
+    frame_end = int(game.home_tracking.index.max())
 
-_DATADIR = os.path.join(_BACKEND_DIR, "data")
-_local_cache: dict = {}  # ゲームデータのメモリキャッシュ
+    return {
+        "game_id": game_id,
+        "pitch": {"length": PITCH_LENGTH, "width": PITCH_WIDTH},
+        "frame_range": {"start": frame_start, "end": frame_end},
+        "fps": FPS,
+        "teams": [
+            {
+                "key": "home",
+                "label": "Home",
+                "column_prefix": home_prefix,
+                "data_key": "home_data",
+                "color": "#e74c3c",
+            },
+            {
+                "key": "away",
+                "label": "Away",
+                "column_prefix": away_prefix,
+                "data_key": "away_data",
+                "color": "#3498db",
+            },
+        ],
+        "ball_column_prefix": ball_prefix,
+    }
 
 
-def _load_local(game_id: int):
-    """ローカル CSV からデータを読み込んでキャッシュする"""
-    if game_id in _local_cache:
-        return _local_cache[game_id]
+@app.get("/api/tracking/{game_id}")
+def get_tracking_data(
+    game_id: int, frame_start: int = 1, frame_end: int = 100
+) -> dict[str, Any]:
+    game = data_cache.get_game(game_id)
+    try:
+        home_slice = game.home_tracking.loc[frame_start:frame_end].fillna(0)
+        away_slice = game.away_tracking.loc[frame_start:frame_end].fillna(0)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail="指定されたフレーム範囲が見つかりません。"
+        ) from exc
 
-    home   = mio.tracking_data(_DATADIR, game_id, 'Home')
-    away   = mio.tracking_data(_DATADIR, game_id, 'Away')
-    events = mio.read_event_data(_DATADIR, game_id)
-    home   = mio.to_metric_coordinates(home)
-    away   = mio.to_metric_coordinates(away)
-    events = mio.to_metric_coordinates(events)
-    home, away, events = mio.to_single_playing_direction(home, away, events)
-    home   = mvel.calc_player_velocities(home, smoothing=True)
-    away   = mvel.calc_player_velocities(away, smoothing=True)
-    gk     = (mio.find_goalkeeper(home), mio.find_goalkeeper(away))
-
-    _local_cache[game_id] = (home, away, events, gk)
-    return _local_cache[game_id]
+    return {
+        "game_id": game_id,
+        "frames": home_slice.index.tolist(),
+        "home_data": home_slice.to_dict(orient="records"),
+        "away_data": away_slice.to_dict(orient="records"),
+    }
 
 
-@app.get("/local/{game_id}/top_events")
-def local_top_events(game_id: int, n: int = 10):
-    """
-    【発表用フォールバック】
-    ローカルの player_importance.csv から上位 N 件を返す。
-    parser.py / database.py の実装を必要としない。
-    """
-    csv_path = os.path.join(_DATADIR, f"Sample_Game_{game_id}", "player_importance.csv")
-    if not os.path.exists(csv_path):
-        raise HTTPException(status_code=404, detail="player_importance.csv が見つかりません。")
+@app.get("/api/importance/{game_id}")
+def get_importance(
+    game_id: int, frame_start: int = 1, frame_end: int = 100
+) -> list[dict[str, Any]]:
+    game = data_cache.get_game(game_id)
+    if game.importance.empty:
+        return []
+
+    filtered = game.importance[
+        (game.importance["frame_id"] >= frame_start)
+        & (game.importance["frame_id"] <= frame_end)
+    ]
+    return filtered[["frame_id", "player_id", "importance_score"]].to_dict(
+        orient="records"
+    )
+
+
+@app.get("/api/top_events/{game_id}")
+def get_top_events(game_id: int, n: int = 10) -> list[dict[str, Any]]:
+    game = data_cache.get_game(game_id)
+    if game.importance.empty:
+        return []
+
+    top = (
+        game.importance.sort_values("importance_score", ascending=False)
+        .drop_duplicates(["player_id", "event_id"])
+        .head(n)
+    )
+
+    result: list[dict[str, Any]] = []
+    for _, row in top.iterrows():
+        try:
+            ev = game.events.loc[int(row["event_id"])]
+            result.append(
+                {
+                    "rank": len(result) + 1,
+                    "event_id": int(row["event_id"]),
+                    "frame_id": int(row["frame_id"]),
+                    "player_id": str(row["player_id"]),
+                    "team": str(row["team"]),
+                    "importance_score": round(float(row["importance_score"]), 4),
+                    "marginal_pc": round(float(row["marginal_pc"]), 4),
+                    "event_type": str(ev.get("Type", "")),
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return result
+
+
+@app.get("/api/counterfactual/{game_id}")
+def get_counterfactual(
+    game_id: int, event_id: int, player_id: str
+) -> dict[str, Any]:
+    game = data_cache.get_game(game_id)
+    try:
+        event = game.events.loc[event_id]
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"event_id={event_id} が見つかりません。"
+        ) from exc
+
+    ball_pos = [event["Start X"], event["Start Y"]]
+    if pd.isna(ball_pos[0]) or pd.isna(ball_pos[1]):
+        raise HTTPException(status_code=400, detail="ボール座標が欠損しています。")
 
     try:
-        home, away, events, gk = _load_local(game_id)
-        df  = pd.read_csv(csv_path)
-        top = (df.sort_values('importance_score', ascending=False)
-                 .drop_duplicates(['player_id', 'event_id'])
-                 .head(n))
-
-        result = []
-        for _, row in top.iterrows():
-            try:
-                ev = events.loc[int(row['event_id'])]
-                result.append({
-                    'rank':             len(result) + 1,
-                    'event_id':         int(row['event_id']),
-                    'frame_id':         int(row['frame_id']),
-                    'player_id':        row['player_id'],
-                    'team':             row['team'],
-                    'importance_score': round(float(row['importance_score']), 4),
-                    'marginal_pc':      round(float(row['marginal_pc']), 4),
-                    'event_type':       str(ev.get('Type', '')),
-                })
-            except Exception:
-                continue
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/local/{game_id}/counterfactual")
-def local_counterfactual(game_id: int, event_id: int, player_id: str):
-    """
-    【発表用フォールバック】
-    ローカルデータを使って反事実PCヒートマップを計算して返す。
-    parser.py / database.py の実装を必要としない。
-    """
-    try:
-        home, away, events, gk = _load_local(game_id)
-        return calculate_counterfactual(home, away, events, event_id, player_id, gk)
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"event_id={event_id} が見つかりません。")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return calculate_counterfactual(
+            game.home,
+            game.away,
+            game.events,
+            event_id,
+            player_id,
+            game.gk,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"反事実計算中にエラー: {exc}"
+        ) from exc

@@ -1,0 +1,26 @@
+name: Analytics CI
+on:
+  push:
+    branches: [ analytics, main ]
+    paths:
+      - 'backend/**' # ★超重要: バックエンドのファイルが変わった時だけ起動
+  pull_request:
+    branches: [ analytics, main ]
+    paths:
+      - 'backend/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: pip install -r backend/requirements.txt
+      - name: Run Ruff Lint
+        run: ruff check backend/src/
+      - name: Run Type Check (mypy)
+        run: mypy backend/src/ --ignore-missing-imports

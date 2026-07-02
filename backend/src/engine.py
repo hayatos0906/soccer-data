@@ -1,104 +1,76 @@
 """
 engine.py — ピッチコントロール計算コアエンジン（先輩担当聖域）
 
-【数理モデル】
-Spearman (2018) "Off the Ball Scoring Opportunities" のピッチコントロールモデルに
-反事実分析（Counterfactual Analysis）を組み合わせて選手の真のオフボール貢献度を測る。
-
-【ガウス重み付け】
-全グリッドを均等に評価するとボール遠方の後方スペースを管理するDFが過大評価されるため、
-各セルにボールからの距離に応じたガウス重み w = exp(-d²/2σ²) を掛けて加重平均をとる。
-σ=20m: 35m離れたセルは約10%にまで減衰 → MF/FWのボール近傍貢献を正当に評価できる。
+Spearman (2018) ピッチコントロールモデル + 反事実分析。
+api.py / player_importance.py とパラメータを統一している。
 """
 
-import os
-import sys
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-# backend/scripts を参照できるようにパスを追加
-_BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if _BACKEND_DIR not in sys.path:
-    sys.path.insert(0, _BACKEND_DIR)
+from src.constants import FIELD_DIMEN
+from src.scripts import Metrica_IO as mio
+from src.scripts import Metrica_PitchControl as mpc
 
-from scripts import Metrica_PitchControl as mpc
-
-# ------------------------------------------------------------------ #
-# 定数
-# ------------------------------------------------------------------ #
-N_GRID_X              = 25    # 可視化用グリッド解像度（分析用は50）
-GAUSSIAN_SIGMA        = 10.0  # ガウス重みの標準偏差 [m]（api.py・player_importance.py と統一）
-PASSIVE_DIST_THRESH   = 30.0  # 距離フィルター閾値 [m]（同上）
-MIN_VELOCITY          = 1.5   # 速度フィルター閾値 [m/s]（同上）
-BEHIND_BALL_MARGIN    = 5.0   # 攻撃チームの後方カット [m]（同上）
+N_GRID_X = 25
+GAUSSIAN_SIGMA = 10.0
+PASSIVE_DIST_THRESH = 30.0
+MIN_VELOCITY = 1.5
+BEHIND_BALL_MARGIN = 5.0
 
 
-# ------------------------------------------------------------------ #
-# 内部ユーティリティ
-# ------------------------------------------------------------------ #
-
-def _active_players(players: list, ball_pos: np.ndarray, att_team: str = '', att_direction: int = 1) -> list:
-    """
-    api.py・player_importance.py と同じ基準でアクティブ選手を絞る。
-      - GK除外
-      - 距離 PASSIVE_DIST_THRESH 超除外
-      - 速度 MIN_VELOCITY 未満除外（静止選手）
-      - 攻撃チームの選手がボールより BEHIND_BALL_MARGIN 以上後方なら除外
-    """
-    active = []
-    for p in players:
-        if p.is_gk:
+def _active_players(
+    players: list[mpc.player],
+    ball_pos: np.ndarray,
+    att_team: str = "",
+    att_direction: int = 1,
+) -> list[mpc.player]:
+    """api.py・player_importance.py と同じ基準でアクティブ選手を絞る。"""
+    active: list[mpc.player] = []
+    for player in players:
+        if player.is_gk:
             continue
-        if np.linalg.norm(p.position - ball_pos) > PASSIVE_DIST_THRESH:
+        if np.linalg.norm(player.position - ball_pos) > PASSIVE_DIST_THRESH:
             continue
-        if np.linalg.norm(p.velocity) < MIN_VELOCITY:
+        if np.linalg.norm(player.velocity) < MIN_VELOCITY:
             continue
-        if att_team and p.teamname == att_team:
-            behind = (p.position[0] - ball_pos[0]) * att_direction
+        if att_team and player.teamname == att_team:
+            behind = (player.position[0] - ball_pos[0]) * att_direction
             if behind < -BEHIND_BALL_MARGIN:
                 continue
-        active.append(p)
+        active.append(player)
     return active
 
 
 def _gaussian_weight(target: np.ndarray, ball_pos: np.ndarray) -> float:
-    """ボールからの距離に応じたガウス重み（0〜1）"""
-    d = np.linalg.norm(target - ball_pos)
-    return float(np.exp(-d**2 / (2.0 * GAUSSIAN_SIGMA**2)))
+    distance = np.linalg.norm(target - ball_pos)
+    return float(np.exp(-(distance**2) / (2.0 * GAUSSIAN_SIGMA**2)))
 
 
 def _compute_pc_grid(
-    att: list,
-    defn: list,
+    att: list[mpc.player],
+    defn: list[mpc.player],
     ball_pos: np.ndarray,
-    params: dict,
+    params: dict[str, float],
     n_x: int = N_GRID_X,
-    field: tuple = (106.0, 68.0),
-) -> tuple[np.ndarray, np.ndarray, list, list]:
-    """
-    ガウス重み付きピッチコントロールグリッドを計算する。
-
-    Returns
-    -------
-    grid         : (n_y, n_x) 各セルの攻撃チーム PC 値
-    weights      : (n_y, n_x) 各セルのガウス重み
-    xgrid, ygrid : セル中心座標リスト
-    """
-    n_y   = int(n_x * field[1] / field[0])
-    dx    = field[0] / n_x
-    dy    = field[1] / n_y
+    field: tuple[float, float] = FIELD_DIMEN,
+) -> tuple[np.ndarray, np.ndarray, list[float], list[float]]:
+    n_y = int(n_x * field[1] / field[0])
+    dx = field[0] / n_x
+    dy = field[1] / n_y
     xgrid = np.arange(n_x) * dx - field[0] / 2.0 + dx / 2.0
     ygrid = np.arange(n_y) * dy - field[1] / 2.0 + dy / 2.0
 
-    grid    = np.zeros((n_y, n_x))
+    grid = np.zeros((n_y, n_x))
     weights = np.zeros((n_y, n_x))
 
     for i in range(n_y):
         for j in range(n_x):
-            target       = np.array([xgrid[j], ygrid[i]])
+            target = np.array([xgrid[j], ygrid[i]])
             weights[i, j] = _gaussian_weight(target, ball_pos)
-            ppcfa, _     = mpc.calculate_pitch_control_at_target(
+            ppcfa, _ = mpc.calculate_pitch_control_at_target(
                 target, att, defn, ball_pos, params
             )
             grid[i, j] = ppcfa
@@ -106,9 +78,12 @@ def _compute_pc_grid(
     return grid, weights, xgrid.tolist(), ygrid.tolist()
 
 
-# ------------------------------------------------------------------ #
-# 公開インターフェース
-# ------------------------------------------------------------------ #
+def _attack_direction(home_df: pd.DataFrame, possession_team: str) -> int:
+    home_direction = int(mio.find_playing_direction(home_df, "Home"))
+    if possession_team == "Home":
+        return home_direction
+    return -home_direction
+
 
 def calculate_pitch_control(
     home_df: pd.DataFrame,
@@ -116,49 +91,27 @@ def calculate_pitch_control(
     frame_id: int,
     ball_pos: np.ndarray | None = None,
     gk_numbers: tuple[str, str] | None = None,
-) -> dict:
-    """
-    【先輩の担当聖域】
-    指定フレームのガウス重み付きピッチコントロールグリッドを返す。
-
-    Parameters
-    ----------
-    home_df     : to_metric_coordinates + calc_player_velocities 適用済みのDF
-    away_df     : 同上
-    frame_id    : 計算対象フレーム番号
-    ball_pos    : ボール座標 [x, y]（メートル）。None の場合はゼロ位置
-    gk_numbers  : (home_gk_id, away_gk_id)。None の場合は自動検出
-
-    Returns
-    -------
-    {
-      "grid"   : list[list[float]],  # (n_y, n_x) PC 値
-      "weights": list[list[float]],  # ガウス重み
-      "xgrid"  : list[float],
-      "ygrid"  : list[float],
-    }
-    """
+) -> dict[str, list[list[float]] | list[float]]:
+    """指定フレームのガウス重み付きピッチコントロールグリッドを返す。"""
     if ball_pos is None:
         ball_pos = np.array([0.0, 0.0])
 
     if gk_numbers is None:
-        from scripts import Metrica_IO as mio
         gk_numbers = (mio.find_goalkeeper(home_df), mio.find_goalkeeper(away_df))
 
     params = mpc.default_model_params()
-
-    att  = mpc.initialise_players(home_df.loc[frame_id], 'Home', params, gk_numbers[0])
-    defn = mpc.initialise_players(away_df.loc[frame_id], 'Away', params, gk_numbers[1])
-    att  = _active_players(att,  ball_pos)
+    att = mpc.initialise_players(home_df.loc[frame_id], "Home", params, gk_numbers[0])
+    defn = mpc.initialise_players(away_df.loc[frame_id], "Away", params, gk_numbers[1])
+    att = _active_players(att, ball_pos)
     defn = _active_players(defn, ball_pos)
 
     grid, weights, xgrid, ygrid = _compute_pc_grid(att, defn, ball_pos, params)
 
     return {
-        "grid":    grid.tolist(),
+        "grid": grid.tolist(),
         "weights": weights.tolist(),
-        "xgrid":   xgrid,
-        "ygrid":   ygrid,
+        "xgrid": xgrid,
+        "ygrid": ygrid,
     }
 
 
@@ -169,68 +122,61 @@ def calculate_counterfactual(
     event_id: int,
     player_id: str,
     gk_numbers: tuple[str, str] | None = None,
-) -> dict:
-    """
-    指定選手がいる場合/いない場合のPC差分（ガウス重み付き）を返す。
-
-    diff_grid の読み方:
-      正の値 = この選手がいることで生み出された（または守られた）空間
-      大きいほど、その場所でのこの選手の貢献が大きい
-
-    Returns
-    -------
-    {
-      "diff_grid"     : list[list[float]],  # ガウス重み付き差分
-      "baseline_grid" : list[list[float]],  # ベースラインPC
-      "ball_pos"      : [float, float],
-      "xgrid", "ygrid", "home_data", "away_data"
-    }
-    """
-    event           = events_df.loc[event_id]
-    frame_id        = int(event['Start Frame'])
-    possession_team = event['Team']
-    ball_pos        = np.array([event['Start X'], event['Start Y']])
+) -> dict[str, object]:
+    """指定選手の反事実ピッチコントロール差分グリッドを返す。"""
+    event = events_df.loc[event_id]
+    frame_id = int(event["Start Frame"])
+    possession_team = str(event["Team"])
+    ball_pos = np.array([event["Start X"], event["Start Y"]])
 
     if gk_numbers is None:
-        from scripts import Metrica_IO as mio
         gk_numbers = (mio.find_goalkeeper(home_df), mio.find_goalkeeper(away_df))
 
     params = mpc.default_model_params()
+    att_direction = _attack_direction(home_df, possession_team)
 
-    if possession_team == 'Home':
-        att  = mpc.initialise_players(home_df.loc[frame_id], 'Home', params, gk_numbers[0])
-        defn = mpc.initialise_players(away_df.loc[frame_id], 'Away', params, gk_numbers[1])
+    if possession_team == "Home":
+        att = mpc.initialise_players(
+            home_df.loc[frame_id], "Home", params, gk_numbers[0]
+        )
+        defn = mpc.initialise_players(
+            away_df.loc[frame_id], "Away", params, gk_numbers[1]
+        )
     else:
-        defn = mpc.initialise_players(home_df.loc[frame_id], 'Home', params, gk_numbers[0])
-        att  = mpc.initialise_players(away_df.loc[frame_id], 'Away', params, gk_numbers[1])
+        defn = mpc.initialise_players(
+            home_df.loc[frame_id], "Home", params, gk_numbers[0]
+        )
+        att = mpc.initialise_players(
+            away_df.loc[frame_id], "Away", params, gk_numbers[1]
+        )
 
-    att  = _active_players(att,  ball_pos)
-    defn = _active_players(defn, ball_pos)
+    att = _active_players(att, ball_pos, possession_team, att_direction)
+    defn = _active_players(defn, ball_pos, possession_team, att_direction)
 
     grid_base, weights, xgrid, ygrid = _compute_pc_grid(att, defn, ball_pos, params)
 
-    target_prefix = player_id.split('_')[0]
+    target_prefix = player_id.split("_")[0]
     if target_prefix == possession_team:
-        att_wo        = [p for p in att  if p.playername.rstrip('_') != player_id]
+        att_wo = [p for p in att if p.playername.rstrip("_") != player_id]
         grid_wo, _, _, _ = _compute_pc_grid(att_wo, defn, ball_pos, params)
         diff = grid_base - grid_wo
     else:
-        def_wo        = [p for p in defn if p.playername.rstrip('_') != player_id]
+        def_wo = [p for p in defn if p.playername.rstrip("_") != player_id]
         grid_wo, _, _, _ = _compute_pc_grid(att, def_wo, ball_pos, params)
         diff = grid_wo - grid_base
 
     weighted_diff = diff * weights
 
     return {
-        "event_id":        event_id,
-        "frame_id":        frame_id,
-        "player_id":       player_id,
+        "event_id": event_id,
+        "frame_id": frame_id,
+        "player_id": player_id,
         "possession_team": possession_team,
-        "ball_pos":        ball_pos.tolist(),
-        "xgrid":           xgrid,
-        "ygrid":           ygrid,
-        "baseline_grid":   grid_base.tolist(),
-        "diff_grid":       weighted_diff.tolist(),
-        "home_data":       home_df.loc[frame_id].fillna(0).to_dict(),
-        "away_data":       away_df.loc[frame_id].fillna(0).to_dict(),
+        "ball_pos": ball_pos.tolist(),
+        "xgrid": xgrid,
+        "ygrid": ygrid,
+        "baseline_grid": grid_base.tolist(),
+        "diff_grid": weighted_diff.tolist(),
+        "home_data": home_df.loc[frame_id].fillna(0).to_dict(),
+        "away_data": away_df.loc[frame_id].fillna(0).to_dict(),
     }
