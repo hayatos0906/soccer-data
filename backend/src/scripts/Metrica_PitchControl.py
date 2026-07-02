@@ -117,9 +117,10 @@ class player:
     def simple_time_to_intercept(self, r_final: np.ndarray) -> float:
         self.PPCF = 0.0
         r_reaction = self.position + self.velocity * self.reaction_time
-        self.time_to_intercept = self.reaction_time + np.linalg.norm(
-            r_final - r_reaction
-        ) / self.vmax
+        self.time_to_intercept = float(
+            self.reaction_time
+            + np.linalg.norm(r_final - r_reaction) / self.vmax
+        )
         return float(self.time_to_intercept)
 
     def probability_intercept_ball(self, t: float) -> float:
@@ -235,7 +236,7 @@ def calculate_pitch_control_at_target(
     if ball_start_pos is None or any(np.isnan(ball_start_pos)):
         ball_travel_time = 0.0
     else:
-        ball_travel_time = (
+        ball_travel_time = float(
             np.linalg.norm(target_position - ball_start_pos)
             / params["average_ball_speed"]
         )
