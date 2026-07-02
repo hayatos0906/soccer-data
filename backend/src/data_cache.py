@@ -108,10 +108,19 @@ def _load_importance(game_id: int) -> pd.DataFrame:
     return _empty_importance()
 
 
+def _normalize_events(events: pd.DataFrame) -> pd.DataFrame:
+    """イベント CSV の列名・座標値の空白を除去する（main 側修正を取り込み）。"""
+    events = events.copy()
+    events.columns = events.columns.str.strip()
+    for col in [c for c in events.columns if c.endswith(("X", "Y"))]:
+        events[col] = pd.to_numeric(events[col], errors="coerce")
+    return events
+
+
 def _load_from_disk(game_id: int, importance: pd.DataFrame) -> GameData:
     home_raw = mio.tracking_data(DATADIR, game_id, "Home")
     away_raw = mio.tracking_data(DATADIR, game_id, "Away")
-    events_raw = mio.read_event_data(DATADIR, game_id)
+    events_raw = _normalize_events(mio.read_event_data(DATADIR, game_id))
 
     home_metric = mio.to_metric_coordinates(home_raw)
     away_metric = mio.to_metric_coordinates(away_raw)

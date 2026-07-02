@@ -1,3 +1,7 @@
+# トラッキングデータ（大容量のため除外、player_importance.csvは含む）
+backend/data/**/Sample_Game_*_RawTrackingData_*.csv
+backend/data/**/Sample_Game_*_RawEventsData.csv
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

@@ -2,6 +2,7 @@
 engine.py — ピッチコントロール計算コアエンジン（先輩担当聖域）
 
 Spearman (2018) ピッチコントロールモデル + 反事実分析。
+api.py / player_importance.py とパラメータを統一している。
 """
 
 from __future__ import annotations
@@ -14,18 +15,33 @@ from src.scripts import Metrica_IO as mio
 from src.scripts import Metrica_PitchControl as mpc
 
 N_GRID_X = 25
-GAUSSIAN_SIGMA = 20.0
-PASSIVE_DIST_THRESH = 40.0
+GAUSSIAN_SIGMA = 10.0
+PASSIVE_DIST_THRESH = 30.0
+MIN_VELOCITY = 1.5
+BEHIND_BALL_MARGIN = 5.0
 
 
-def _active_players(players: list[mpc.player], ball_pos: np.ndarray) -> list[mpc.player]:
-    """GK と局面外（40m超）の選手を除外する。"""
-    return [
-        p
-        for p in players
-        if not p.is_gk
-        and np.linalg.norm(p.position - ball_pos) <= PASSIVE_DIST_THRESH
-    ]
+def _active_players(
+    players: list[mpc.player],
+    ball_pos: np.ndarray,
+    att_team: str = "",
+    att_direction: int = 1,
+) -> list[mpc.player]:
+    """api.py・player_importance.py と同じ基準でアクティブ選手を絞る。"""
+    active: list[mpc.player] = []
+    for player in players:
+        if player.is_gk:
+            continue
+        if np.linalg.norm(player.position - ball_pos) > PASSIVE_DIST_THRESH:
+            continue
+        if np.linalg.norm(player.velocity) < MIN_VELOCITY:
+            continue
+        if att_team and player.teamname == att_team:
+            behind = (player.position[0] - ball_pos[0]) * att_direction
+            if behind < -BEHIND_BALL_MARGIN:
+                continue
+        active.append(player)
+    return active
 
 
 def _gaussian_weight(target: np.ndarray, ball_pos: np.ndarray) -> float:
@@ -60,6 +76,13 @@ def _compute_pc_grid(
             grid[i, j] = ppcfa
 
     return grid, weights, xgrid.tolist(), ygrid.tolist()
+
+
+def _attack_direction(home_df: pd.DataFrame, possession_team: str) -> int:
+    home_direction = int(mio.find_playing_direction(home_df, "Home"))
+    if possession_team == "Home":
+        return home_direction
+    return -home_direction
 
 
 def calculate_pitch_control(
@@ -110,6 +133,7 @@ def calculate_counterfactual(
         gk_numbers = (mio.find_goalkeeper(home_df), mio.find_goalkeeper(away_df))
 
     params = mpc.default_model_params()
+    att_direction = _attack_direction(home_df, possession_team)
 
     if possession_team == "Home":
         att = mpc.initialise_players(
@@ -126,8 +150,8 @@ def calculate_counterfactual(
             away_df.loc[frame_id], "Away", params, gk_numbers[1]
         )
 
-    att = _active_players(att, ball_pos)
-    defn = _active_players(defn, ball_pos)
+    att = _active_players(att, ball_pos, possession_team, att_direction)
+    defn = _active_players(defn, ball_pos, possession_team, att_direction)
 
     grid_base, weights, xgrid, ygrid = _compute_pc_grid(att, defn, ball_pos, params)
 
